@@ -1,0 +1,109 @@
+name: Build and publish H2O
+
+on:
+  schedule:
+    - cron: "23 3 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild even if the upstream commit has already been published
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: h2o-ghcr-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Resolve upstream commit and image name
+        id: upstream
+        run: |
+          sha="$(git ls-remote https://github.com/h2o/h2o.git HEAD | cut -f1)"
+          if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Could not resolve the h2o/h2o default-branch commit" >&2
+            exit 1
+          fi
+          printf 'sha=%s\nimage=ghcr.io/%s\n' "$sha" "${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check whether the commit is already published
+        id: check
+        env:
+          IMAGE: ${{ steps.upstream.outputs.image }}
+          SHA: ${{ steps.upstream.outputs.sha }}
+          FORCE: ${{ inputs.force || false }}
+        run: |
+          if [[ "$FORCE" == "true" ]]; then
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+            echo "Forced rebuild requested."
+          elif manifest="$(docker buildx imagetools inspect "$IMAGE:sha-$SHA" 2>&1)"; then
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+            echo "Already published: \`$IMAGE:sha-$SHA\`. Skipping the build." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+            printf 'Commit tag is absent or could not be read; attempting a build.\n%s\n' "$manifest"
+          fi
+
+      - name: Check out the Docker build files
+        if: steps.check.outputs.needed == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Build and push
+        if: steps.check.outputs.needed == 'true'
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          pull: true
+          push: true
+          no-cache: ${{ inputs.force || false }}
+          build-args: |
+            H2O_COMMIT=${{ steps.upstream.outputs.sha }}
+          tags: |
+            ${{ steps.upstream.outputs.image }}:latest
+            ${{ steps.upstream.outputs.image }}:sha-${{ steps.upstream.outputs.sha }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ steps.upstream.outputs.sha }}
+            org.opencontainers.image.url=https://github.com/h2o/h2o
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summarize publication
+        if: steps.check.outputs.needed == 'true'
+        env:
+          IMAGE: ${{ steps.upstream.outputs.image }}
+          SHA: ${{ steps.upstream.outputs.sha }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          {
+            echo "Published \`$IMAGE:latest\` and \`$IMAGE:sha-$SHA\`."
+            echo ""
+            echo "Upstream commit: \`$SHA\`"
+            echo "Image digest: \`$DIGEST\`"
+          } >> "$GITHUB_STEP_SUMMARY"
